@@ -90,8 +90,12 @@ Mit `--vt-pool` kommt vor dem Anhang das Kapitel **Bedienoberfläche** dazu:
   ISO-Designer-Projekt (`img/`)
 
 Querverweise in beide Richtungen: Nennt ein Parameter einer 4diac-Instanz ein Objekt des Pools
-(`u16DataMaskId = DataMask_1000`, `IN1 = SoftKeyMask_PAGE_1`, bei ISOBUS-Bausteinen auch die
-nackte Objekt-ID), dann zeigt die Instanztabelle `VT S<n>`, und die Objekttabelle listet die Instanz.
+(`u16DataMaskId = DataMask_1000`, `IN1 = SoftKeyMask_PAGE_1`, an ID-Eingängen von
+ISOBUS-Bausteinen wie `u16ObjId` auch die nackte Objekt-ID), dann zeigt die Instanztabelle `VT S<n>`
+(je VT-Blatt ein Link), und die Objekttabelle listet die Instanz.
+
+Passt `Output/<Pool>.iop.h` nicht mehr zur `.jop` (Objekt umbenannt oder neu nummeriert, Pool nicht
+neu übersetzt), zeichnet das Tool keine Bilder und nennt den Grund auf dem Übersichtsblatt.
 
 Woher die Teile kommen:
 

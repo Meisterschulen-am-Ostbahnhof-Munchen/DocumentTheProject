@@ -27,6 +27,7 @@ Alle Pfade kommen als Parameter (siehe generate_doc.bat), keiner steht hier.
 import argparse
 import datetime
 import hashlib
+import json
 import io
 import os
 import re
@@ -43,30 +44,26 @@ from urllib.request import url2pathname
 __version__ = "0.2.0"
 
 
-def _locate_svg_tool(argv: List[str]) -> Optional[Path]:
-    """The converter path is needed before argparse runs (module import)."""
-    for i, arg in enumerate(argv):
-        if arg == "--svg-tool" and i + 1 < len(argv):
-            return Path(argv[i + 1])
-        if arg.startswith("--svg-tool="):
-            return Path(arg.split("=", 1)[1])
-    env = os.environ.get("IEC61499_SVG_TOOL")
-    return Path(env) if env else None
+SVG_TOOL_DIR: Optional[Path] = None
+netsvg = fbsvg = None   # IEC61499_FunctionBlock_SVG, imported by load_svg_tool()
 
 
-SVG_TOOL_DIR = _locate_svg_tool(sys.argv)
-if SVG_TOOL_DIR is None:
-    sys.exit("[FEHLER] Pfad zu IEC61499_FunctionBlock_SVG fehlt: --svg-tool <Pfad> "
-             "oder Umgebungsvariable IEC61499_SVG_TOOL angeben (siehe generate_doc.bat).")
-if str(SVG_TOOL_DIR) not in sys.path:
-    sys.path.insert(0, str(SVG_TOOL_DIR))
-
-try:
-    import iec61499_network_to_svg as netsvg
-    import iec61499_to_svg as fbsvg
-except ImportError as exc:  # pragma: no cover - environment problem
-    sys.exit(f"[FEHLER] IEC61499_FunctionBlock_SVG nicht gefunden unter {SVG_TOOL_DIR}: {exc}\n"
-             f"         Pfad mit --svg-tool oder Umgebungsvariable IEC61499_SVG_TOOL angeben.")
+def load_svg_tool(path: Optional[Path]):
+    """Import the converters from IEC61499_FunctionBlock_SVG; called after argparse, so that
+    --help and --version work without the path."""
+    global SVG_TOOL_DIR, netsvg, fbsvg
+    if path is None:
+        sys.exit("[FEHLER] Pfad zu IEC61499_FunctionBlock_SVG fehlt: --svg-tool <Pfad> "
+                 "oder Umgebungsvariable IEC61499_SVG_TOOL angeben (siehe generate_doc.bat).")
+    SVG_TOOL_DIR = path
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+    try:
+        import iec61499_network_to_svg as netsvg
+        import iec61499_to_svg as fbsvg
+    except ImportError as exc:  # pragma: no cover - environment problem
+        sys.exit(f"[FEHLER] IEC61499_FunctionBlock_SVG nicht gefunden unter {path}: {exc}\n"
+                 f"         Pfad mit --svg-tool oder Umgebungsvariable IEC61499_SVG_TOOL angeben.")
 
 from reportlab.graphics import renderPDF
 from reportlab.lib import colors
@@ -671,19 +668,38 @@ class VtPool:
                 return int(m.group(1))
         return None
 
+    def _stale_names(self) -> List[str]:
+        """Object names whose id in the compiled .iop.h differs from the .jop (or that are gone):
+        the .iop was translated from an older pool and its images would not match the tables."""
+        header = self.iop.with_name(self.iop.name + ".h")
+        if not header.exists():
+            return []
+        stale = []
+        for name, value in re.findall(r"#define\s+(\w+)\s+(\d+)\s*$", header.read_text(encoding="latin-1"), re.M):
+            if name.startswith(("ISO_", "MASK_")):
+                continue
+            if self.ids_by_name.get(name) != int(value):
+                stale.append(name)
+        return stale
+
     # ----- vt-render -----
 
     def _render(self, exe: Path, softkeys: Optional[int], mask_size: Optional[int], title: str, org: str):
         if not self.iop.exists():
             self.render_error = f"{self.iop} fehlt (Pool im ISO-Designer übersetzen)"
             return
+        stale = self._stale_names()
+        if stale:
+            self.render_error = (f"{self.iop.name} passt nicht zu {self.jop.name} ({', '.join(stale[:5])}"
+                                 f"{', ...' if len(stale) > 5 else ''}): Pool im ISO-Designer neu übersetzen")
+            return
         data = self.iop.read_bytes()
         with tempfile.TemporaryDirectory(prefix="vt-render-") as tmp:
             meta = Path(tmp) / "meta.yaml"
             meta.write_text("\n".join([
                 f'id: "{hashlib.sha256(data).hexdigest()[:8]}"',
-                f"name: {title}",
-                f"manufacturer: {org or 'TODO'}",
+                f"name: {json.dumps(title)}",   # JSON strings are valid YAML scalars
+                f"manufacturer: {json.dumps(org or 'TODO')}",
                 "public: false",
                 "render:",
                 f"  data_mask_size: {mask_size or 'TODO'}",
@@ -698,9 +714,11 @@ class VtPool:
             except OSError as exc:
                 self.render_error = f"vt-render konnte nicht gestartet werden: {exc}"
                 return
+            except subprocess.TimeoutExpired:
+                self.render_error = "vt-render hat nach 300 s nicht geantwortet"
+                return
             print(f"  vt-render: {proc.stdout.strip() or proc.stderr.strip()}")
             try:
-                import json
                 self.manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 self.render_error = f"vt-render (Exit-Code {proc.returncode}): kein manifest.json ({exc})"
@@ -1517,9 +1535,10 @@ class Document:
             vt_ids = self._vt_refs(elem)
             for oid in vt_ids:
                 self.vt_usages.setdefault(oid, []).append(Usage(net_sheet.key, name, field_))
-            if vt_ids and (child is None or child.library is not None):
-                key = self._vt_key(vt_ids[0])
-                ref = Cell(f"{ref.text}, VT {self.ref(key)}".lstrip(", "), key)
+            if vt_ids:
+                parts = [(ref.text, ref.link)] if ref.text else []
+                parts += [(f"VT {self.ref(key)}", key) for key in dict.fromkeys(map(self._vt_key, vt_ids))]
+                ref = Cell(", ".join(text for text, _ in parts), parts=parts)
             where = Cell(f"{self.ref(net_sheet.key)}/{field_}", net_sheet.key) if field_ else Cell("")
             rows.append([Cell(name), where, type_cell, Cell(params), ref])
             # instance -> type reference next to the block on the network sheet
@@ -1562,8 +1581,10 @@ class Document:
         """VT objects named in the instance's parameters, e.g. QI := SoftKey_Licht."""
         if self.vt is None:
             return []
-        numeric = "isobus" in elem.get("Type", "").lower()
-        ids = [self.vt.lookup(p.get("Value", ""), numeric) for p in elem.findall("Parameter")]
+        isobus = "isobus" in elem.get("Type", "").lower()
+        # plain numbers only on object id inputs of ISOBUS blocks (u16ObjId, u16DataMaskId, ...)
+        ids = [self.vt.lookup(p.get("Value", ""), isobus and p.get("Name", "").lower().endswith("id"))
+               for p in elem.findall("Parameter")]
         return [i for i in dict.fromkeys(ids) if i is not None]
 
     def _vt_key(self, oid: int) -> str:
@@ -2080,7 +2101,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--lib", action="append", default=[], help="Zusätzliche Typbibliothek (mehrfach möglich)")
     parser.add_argument("--paper", choices=sorted(PAPER), default="A4", help="Papierformat (Standard: A4)")
     parser.add_argument("--title", help="Projekttitel auf Deckblatt und Schriftfeld")
-    parser.add_argument("--svg-tool", default=str(SVG_TOOL_DIR),
+    parser.add_argument("--svg-tool", default=os.environ.get("IEC61499_SVG_TOOL"),
                         help="Pfad zu IEC61499_FunctionBlock_SVG (oder Umgebungsvariable IEC61499_SVG_TOOL)")
     vt = parser.add_argument_group("Bedienoberfläche (ISOBUS-VT)")
     vt.add_argument("--vt-pool", help="ISO-Designer-Poolordner (mit .jop und Output/<Pool>.iop)")
@@ -2094,6 +2115,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.vt_pool and not args.pool_scripts:
         parser.error("--vt-pool braucht --pool-scripts")
 
+    load_svg_tool(Path(args.svg_tool) if args.svg_tool else None)
     init_fonts()
     missing_libs = [p for p in args.lib if not Path(p).is_dir()]
     if missing_libs:
