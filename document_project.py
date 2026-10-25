@@ -1818,10 +1818,11 @@ class Document:
             flow.space()
         rows = []
         for obj in objects:
+            # the image goes on the root row only; the rows below it keep their text
             if obj.cls == "CWorkingSet":
                 thumb = vt.images.get("ws_designator.png")
             else:
-                thumb = vt.bitmap(obj.id) if obj.cls in ("CImage", "CAuxFunction") else None
+                thumb = vt.bitmap(obj.id) if obj.cls == "CAuxFunction" else None
             rows.append([Cell(str(obj.id)), Cell("", image=thumb, image_h=9 * mm),
                          Cell(obj.name, indent=obj.depth),
                          Cell(obj.cls[1:] if obj.cls.startswith("C") else obj.cls),
