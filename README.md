@@ -85,6 +85,9 @@ Mit `--vt-pool` kommt vor dem Anhang das Kapitel **Bedienoberfläche** dazu:
   Alarm- und Soft-Key-Masken einzeln
 - **je Maske eine Objekttabelle**: alle Objekte der Maske als Baum (ohne CProxy), mit
   `Blatt/Feld` auf dem Bildblatt und „Verwendet in (4diac)“
+- **Working Set und Auxiliary-Funktionen**: je ein Blatt mit dem Objektbaum. Der VT zeichnet
+  Auxiliary-Funktionen nicht, deshalb zeigt die Bildspalte dort die Bitmap aus dem
+  ISO-Designer-Projekt (`img/`)
 
 Querverweise in beide Richtungen: Nennt ein Parameter einer 4diac-Instanz ein Objekt des Pools
 (`u16DataMaskId = DataMask_1000`, `IN1 = SoftKeyMask_PAGE_1`, bei ISOBUS-Bausteinen auch die

@@ -583,7 +583,21 @@ class VtPool:
         for mask in sorted(self.masks, key=lambda m: m.cls != "CSoftKeyMask"):
             for obj in mask.objects:
                 self.home.setdefault(obj.id, mask.id)
+        # roots outside the masks (list_mask_objects.py treats them as roots as well)
         self.aux = [jid for jid in sorted(self.cls) if self.cls[jid] == "CAuxFunction"]
+        self.aux_objects = self._tree([(a, None) for a in self.aux])
+        self.ws_objects: List[VtObject] = []
+        for ws in sorted(j for j, c in self.cls.items() if c == "CWorkingSet"):
+            # like a mask, the working set keeps its designator objects in its own .jvi
+            children = self._tree([(c, None) for c, _ in self._components(ws)])
+            for obj in children:
+                obj.depth += 1
+            self.ws_objects += [VtObject(ws, "CWorkingSet", self.names.get(ws, ""))] + children
+        for home, objects in (("ws", self.ws_objects), ("aux", self.aux_objects)):
+            for obj in objects:
+                self.home.setdefault(obj.id, home)
+        self._bitmap_paths = self._bitmap_files(self.jop)
+        self._bitmaps: Dict[int, Optional[VtImage]] = {}
 
     # ----- ISO-Designer files -----
 
@@ -600,6 +614,32 @@ class VtPool:
                 except (TypeError, ValueError):
                     pass
         return sizes
+
+    @staticmethod
+    def _bitmap_files(jop: Path) -> Dict[int, str]:
+        """Source bitmap of every picture graphic (CImage), relative to the pool folder."""
+        files = {}
+        for obj in ET.parse(jop).getroot().iter("Object"):
+            path = obj.find("./PropertySheet[@Name='Image']/Property[@Name='Path']/Value")
+            if obj.get("Class") == "CImage" and path is not None and path.text and path.text.strip():
+                files[int(obj.get("JVS-ID"))] = path.text.strip().replace("\\", "/")
+        return files
+
+    def bitmap(self, jid: int) -> Optional[VtImage]:
+        """The ISO-Designer bitmap of a picture graphic, or of the first one below jid: for objects
+        the VT does not draw, such as auxiliary functions."""
+        if jid not in self._bitmaps:
+            self._bitmaps[jid] = None
+            ids = [jid] + [c for _, c in self.lmo.resolve_tree([jid], self.children, set())]
+            path = next((self._bitmap_paths[i] for i in ids if i in self._bitmap_paths), None)
+            if path is not None:
+                try:
+                    from PIL import Image
+                    with Image.open(self.dir / path) as img:
+                        self._bitmaps[jid] = VtImage.of(img.convert("RGB"))
+                except OSError as exc:
+                    print(f"[WARNUNG] Bitmap {path}: {exc}", file=sys.stderr)
+        return self._bitmaps[jid]
 
     def _jvi(self, jid: int) -> Optional[Path]:
         rel = self.paths.get(jid)
@@ -1733,17 +1773,15 @@ class Document:
             flow.subheading("Working-Set-Symbol")
             flow.image(designator, 30 * mm)
 
-        flow.subheading("Masken")
-        flow.table([("Blatt", 1.2), ("Art", 3), ("Maske", 5), ("Soft-Key-Maske", 5), ("Objekte", 1.5)],
+        flow.subheading("Masken und weitere Wurzelobjekte")
+        flow.table([("Blatt", 1.2), ("Art", 3), ("Objekt", 5), ("Soft-Key-Maske", 5), ("Objekte", 1.5)],
                    [[Cell(self.ref(f"vt:{mk.id}"), f"vt:{mk.id}"), Cell(VT_MASK_LABELS[mk.cls]),
                      Cell(vt.label(mk.id), f"vt:{mk.id}"),
                      Cell(vt.label(mk.soft_key_mask), f"vt:{mk.soft_key_mask}") if mk.soft_key_mask is not None
                      else Cell(""),
-                     Cell(str(sum(o.cls != "CSoftKeyMask" for o in mk.objects)))] for mk in vt.masks])
-        if vt.aux:
-            flow.subheading("Auxiliary-Funktionen")
-            flow.table([("ID", 1.2), ("Name", 5), ("Verwendet in (4diac)", 9)],
-                       [[Cell(str(a)), Cell(vt.names.get(a, "")), self._vt_usage_cell(a)] for a in vt.aux])
+                     Cell(str(sum(o.cls != "CSoftKeyMask" for o in mk.objects)))] for mk in vt.masks]
+                   + [[Cell(self.ref(key), key), Cell(art), Cell(text, key), Cell(""), Cell(str(len(objects)))]
+                      for key, art, text, objects in self._vt_other_roots() if objects])
         unsupported = [u for u in m.get("unsupported_objects", []) if u.get("status") == "unsupported"]
         if unsupported:
             flow.subheading("Vom Renderer nicht gezeichnete Objekte")
@@ -1753,6 +1791,43 @@ class Document:
         self._out.extend(flow.sheets)
         for mask in vt.masks:
             self._plan_vt_mask(mask)
+        for key, art, text, objects in self._vt_other_roots():
+            if objects:
+                self._plan_vt_root(key, art, text, objects)
+
+    def _vt_other_roots(self):
+        vt = self.vt
+        ws = [o for o in vt.ws_objects if o.cls == "CWorkingSet"]
+        return [("vt:ws", "Working Set", ", ".join(vt.label(o.id) for o in ws), vt.ws_objects),
+                ("vt:aux", "Auxiliary-Funktionen", f"{len(vt.aux)} Funktionen", vt.aux_objects)]
+
+    def _plan_vt_root(self, key: str, art: str, text: str, objects: List[VtObject]):
+        """Working set and auxiliary functions: no mask image, a table with the object tree."""
+        vt = self.vt
+        flow = self._vt_flow(key, art, text, 1)
+        flow.heading(f"{art} – {text}")
+        if key == "vt:ws":
+            designator = vt.images.get("ws_designator.png")
+            if designator is not None:
+                flow.subheading("Working-Set-Symbol (vt-render)")
+                flow.image(designator, 30 * mm)
+        else:
+            flow.para("Der VT zeichnet Auxiliary-Funktionen nicht, deshalb gibt es kein vt-render-Bild. "
+                      "Die Spalte Bild zeigt die Bitmap aus dem ISO-Designer-Projekt (erstes Bildobjekt der "
+                      "Funktion).", color=GREY)
+            flow.space()
+        rows = []
+        for obj in objects:
+            if obj.cls == "CWorkingSet":
+                thumb = vt.images.get("ws_designator.png")
+            else:
+                thumb = vt.bitmap(obj.id) if obj.cls in ("CImage", "CAuxFunction") else None
+            rows.append([Cell(str(obj.id)), Cell("", image=thumb, image_h=9 * mm),
+                         Cell(obj.name, indent=obj.depth),
+                         Cell(obj.cls[1:] if obj.cls.startswith("C") else obj.cls),
+                         self._vt_usage_cell(obj.id)])
+        flow.table([("ID", 1.2), ("Bild", 2.2), ("Name", 5), ("Klasse", 2.3), ("Verwendet in (4diac)", 8.4)], rows)
+        self._out.extend(flow.sheets)
 
     def _plan_vt_mask(self, mask: VtMask):
         vt = self.vt
