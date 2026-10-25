@@ -10,11 +10,13 @@ Erzeugt aus einem Eclipse 4diac™-Projekt eine PDF-Dokumentation im Stil eines 
 3. **Ressource** (z. B. `FORTE_PC.EMB_RES`): Netzwerk der Ressource mit den zugeordneten
    (gemappten) Applikationselementen, dazu ein Übersichtsblatt mit Gerät, Parametern,
    Mapping, Kommunikation und Instanzliste
-4. **Rekursiv in die Tiefe**: Jeder Projekttyp (SubApp, Composite-FB, Basis-FB, …) wird
-   **einmal** dokumentiert, mit einem Netzwerkblatt und einem Schnittstellenblatt
-   (Schnittstellengrafik, Ereignisse, Daten, Adapter, Instanzen, Gruppen, ECC/Algorithmen)
-5. **Anhang**: verwendete Bibliothekstypen mit Verwendungsstellen, globale Konstanten (`.gcf`),
-   Bibliotheksabhängigkeiten (`MANIFEST.MF`)
+4. **Rekursiv in die Tiefe**: Jeder Projekttyp wird **einmal** dokumentiert. Typen mit Netzwerk
+   (SubApp, Composite-FB) bekommen ein Netzwerkblatt; jeder Typ bekommt ein Schnittstellenblatt
+   (Schnittstellengrafik, Ereignisse, Daten, Adapter, Instanzen, Gruppen; bei Basis-/Simple-FBs
+   ECC und Algorithmen)
+5. **Nicht verwendete Projekttypen und Datentypen** des Projekts
+6. **Anhang**: verwendete Bibliothekstypen mit Verwendungsstellen, nicht auflösbare Typen
+   (mit Grund), globale Konstanten (`.gcf`), Bibliotheksabhängigkeiten (`MANIFEST.MF`)
 
 Jedes Blatt hat einen **Zeichnungsrahmen** (Heftrand links, Feldeinteilung `1…n` / `A…x`)
 und ein **Schriftfeld** mit Projekt, Blattinhalt, Typ und **„Blatt n von m“**.
@@ -25,7 +27,8 @@ und ein **Schriftfeld** mit Projekt, Blattinhalt, Typ und **„Blatt n von m“*
   Mehrere Instanzen desselben Typs verweisen alle auf dasselbe Blatt.
 - Das Typ-Blatt listet unter „Verwendet in“ alle Verwendungsstellen als `Blatt/Feld`,
   z. B. `S8/E3 (Klappen), S8/B4 (Verteiler)`.
-- Alle Verweise, das Inhaltsverzeichnis und die PDF-Lesezeichen sind klickbar.
+- Alle Verweise (auch jede einzelne Verwendungsstelle), das Inhaltsverzeichnis (inklusive
+  Fortsetzungsblätter) und die PDF-Lesezeichen sind klickbar.
 
 ## Voraussetzungen
 

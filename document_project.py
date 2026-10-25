@@ -23,6 +23,7 @@ import io
 import os
 import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,7 +128,7 @@ KIND_LABELS = {
     "UntypedSubApp": "Untypisierte Subapplikation",
 }
 
-TYPE_EXTENSIONS = (".fbt", ".sub", ".adp", ".dtp", ".fct")
+TYPE_EXTENSIONS = (".fbt", ".sub", ".adp", ".dtp", ".fct", ".res")
 
 
 # ===========================================================================
@@ -255,6 +256,8 @@ class Project:
         self.workspace = project_dir.parent
         self.name = project_dir.name
         self.manifest = self._read_xml(project_dir / "MANIFEST.MF")
+        self.warnings: List[str] = []
+        self.problems: Dict[str, str] = {}   # unresolved type name -> reason
         self.lib_dirs = self._linked_libraries() + [(p.name, p) for p in extra_libs]
         self.types: Dict[str, TypeInfo] = {}
         self.types_by_short: Dict[str, List[TypeInfo]] = {}
@@ -284,6 +287,8 @@ class Project:
                 path = self._resolve_uri(uri)
                 if path and path.is_dir():
                     libs.append((name.split("/", 1)[1], path))
+                else:
+                    self.warnings.append(f"Bibliothek {name.split('/', 1)[1]} nicht gefunden: {uri}")
         if not libs:
             lib_root = self.workspace / ".lib"
             if lib_root.is_dir():
@@ -328,33 +333,42 @@ class Project:
         self._lib_files = {}
         for lib_name, lib_dir in self.lib_dirs:
             for path in lib_dir.rglob("*"):
-                if path.suffix.lower() in TYPE_EXTENSIONS + (".res", ".dev"):
+                if path.suffix.lower() in TYPE_EXTENSIONS + (".dev",):
                     self._lib_files.setdefault(path.stem, []).append((lib_name, path))
 
     def resolve(self, type_name: str) -> Optional[TypeInfo]:
-        """Project types win over library types; full names win over short names."""
+        """Project types win over library types. A qualified name (a::b::C) must match the
+        type's namespace; an unqualified name must be unique. Otherwise the reason is kept
+        in self.problems and None is returned."""
         if not type_name:
             return None
         if type_name in self.types:
             return self.types[type_name]
         short = short_name(type_name)
-        candidates = self.types_by_short.get(short, [])
-        if len(candidates) == 1:
-            return candidates[0]
         if self._lib_files is None:
             self._index_libs()
         hits = self._lib_files.get(short, [])
-        if not hits:
+        if "::" in type_name:
+            for lib_name, lib_dir in self.lib_dirs:
+                for hit_lib, path in hits:
+                    if hit_lib != lib_name:
+                        continue
+                    info = self._load_lib(lib_name, path)
+                    # namespace from <CompilerInfo packageName> or, as in older libraries, from the folder
+                    folder_name = "::".join(path.relative_to(lib_dir).with_suffix("").parts)
+                    if info and type_name in (info.full_name, folder_name):
+                        return info
+            found = [t.full_name for t in self.types_by_short.get(short, [])] + [str(p) for _, p in hits]
+            self.problems[type_name] = ("Namensraum passt zu keinem Kandidaten: " + ", ".join(found)) if found                 else "nicht gefunden"
             return None
-        if len(hits) > 1 and "::" in type_name:
-            wanted = type_name.split("::")[:-1]
-            for lib_name, path in hits:
-                info = self._load_lib(lib_name, path)
-                if info and info.full_name == type_name:
-                    return info
-            # fall back to the path that best matches the namespace
-            hits = sorted(hits, key=lambda h: -sum(p in h[1].parts for p in wanted))
-        return self._load_lib(*hits[0])
+        candidates = self.types_by_short.get(short, [])
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates and len(hits) == 1:
+            return self._load_lib(*hits[0])
+        found = [t.full_name for t in candidates] or [str(p) for _, p in hits]
+        self.problems[type_name] = ("mehrdeutig: " + ", ".join(found)) if found else "nicht gefunden"
+        return None
 
     def _load_lib(self, lib_name: str, path: Path) -> Optional[TypeInfo]:
         if path not in self._lib_cache:
@@ -433,7 +447,10 @@ class DiagramFactory:
 
     @staticmethod
     def _to_drawing(svg: str):
-        return svglib.svg2rlg(io.BytesIO(svg.encode("utf-8")))
+        drawing = svglib.svg2rlg(io.BytesIO(svg.encode("utf-8")))
+        if drawing is None or not drawing.width or not drawing.height:
+            raise ValueError("svglib konnte die SVG-Grafik nicht umsetzen")
+        return drawing
 
 
 # ===========================================================================
@@ -458,6 +475,26 @@ class Cell:
     link: Optional[str] = None     # bookmark key
     font: Optional[str] = None
     indent: int = 0                # indentation steps (table of contents)
+    parts: Optional[List[Tuple[str, Optional[str]]]] = None   # ", "-separated items with own links
+
+    def lines(self, size: float, width: float) -> List[List[Tuple[str, Optional[str], float]]]:
+        """Wrapped lines as segments (text, link, x offset)."""
+        font = self.font or FONT
+        width -= self.indent * INDENT
+        if self.parts is None:
+            return [[(line, self.link, 0.0)] for line in wrap(self.text, font, size, width)]
+        lines: List[List[Tuple[str, Optional[str], float]]] = [[]]
+        x = 0.0
+        for i, (text, link) in enumerate(self.parts):
+            label = text + ("," if i < len(self.parts) - 1 else "")
+            w = pdfmetrics.stringWidth(label, font, size)
+            gap = pdfmetrics.stringWidth(" ", font, size) if lines[-1] else 0.0
+            if lines[-1] and x + gap + w > width:
+                lines.append([])
+                x, gap = 0.0, 0.0
+            lines[-1].append((label, link, x + gap))
+            x += gap + w
+        return lines
 
 
 @dataclass
@@ -581,29 +618,37 @@ class Flow:
         pad = 1.2 * mm
         lead = size * 1.25
 
-        def layout(cells: List[Cell]):
-            wrapped = [wrap(cell.text, cell.font or FONT, size, w - 2 * pad - cell.indent * INDENT)
-                       for cell, w in zip(cells, widths)]
-            return wrapped, max(len(lines) for lines in wrapped) * lead + 2 * pad - (lead - size)
+        def height(wrapped) -> float:
+            return max(len(lines) for lines in wrapped) * lead + 2 * pad - (lead - size)
 
         header = [Cell(t) for t, _ in columns]
+        hw = [cell.lines(size, w - 2 * pad) for cell, w in zip(header, widths)]
+        hh = height(hw)
+        # rows taller than a whole sheet are split into several rows
+        max_lines = max(1, int((self.geo.area.h - hh - 2 * pad + (lead - size)) / lead))
 
-        def emit(cells: List[Cell], wrapped, h, is_header: bool):
+        def emit(cells: List[Cell], wrapped, is_header: bool):
+            h = height(wrapped)
             x0, y0 = self.geo.area.x, self.y - h
             items = list(zip(cells, wrapped, widths))
             self.sheet.ops.append(lambda c, d: _table_row(c, x0, y0, h, items, size, lead, pad, is_header))
             self.y = y0
 
-        hw, hh = layout(header)
-        for idx, row in enumerate(rows):
-            wrapped, h = layout(row)
-            if idx == 0:
-                self._need(hh + h)
-                emit(header, hw, hh, True)
-            elif self.y - h < self.geo.area.y:
-                self._new_sheet()
-                emit(header, hw, hh, True)
-            emit(row, wrapped, h, False)
+        first = True
+        for row in rows:
+            full = [cell.lines(size, w - 2 * pad) for cell, w in zip(row, widths)]
+            n = max(len(lines) for lines in full)
+            for start in range(0, n, max_lines):
+                wrapped = [lines[start:start + max_lines] or [[]] for lines in full]
+                h = height(wrapped)
+                if first:
+                    self._need(hh + h)
+                    emit(header, hw, True)
+                    first = False
+                elif self.y - h < self.geo.area.y:
+                    self._new_sheet()
+                    emit(header, hw, True)
+                emit(row, wrapped, False)
         self.y -= 4 * mm
 
 
@@ -651,12 +696,16 @@ def _table_row(c, x, y, h, items, size, lead, pad, is_header):
         c.rect(x, y, sum(w for _, _, w in items), h, stroke=0, fill=1)
     cx = x
     for cell, lines, w in items:
-        color = LINK if cell.link else INK
+        font = cell.font or FONT
         ty = y + h - pad - size
         for line in lines:
-            _text(c, cx + pad + cell.indent * INDENT, ty, line, cell.font or FONT, size, color)
+            for text, link, dx in line:
+                tx = cx + pad + cell.indent * INDENT + dx
+                _text(c, tx, ty, text, font, size, LINK if link else INK)
+                if link and cell.parts is not None:
+                    _link(c, link, tx, ty - 1.5, pdfmetrics.stringWidth(text, font, size), size + 2.5)
             ty -= lead
-        if cell.link:
+        if cell.link and cell.parts is None:
             _link(c, cell.link, cx, y, w, h)
         c.setStrokeColor(GREY)
         c.setLineWidth(0.3)
@@ -715,7 +764,7 @@ class Document:
     def plan(self):
         """Lay out all sheets. Repeated until page numbers are stable, since
         references ('-> S9') are part of the layout."""
-        for _ in range(4):
+        for _ in range(10):
             before = dict(self.page_of)
             self._plan_once()
             self.page_of = {}
@@ -723,7 +772,8 @@ class Document:
                 sheet.number = n
                 self.page_of.setdefault(sheet.key, n)
             if self.page_of == before and before:
-                break
+                return
+        raise RuntimeError("Blattnummern stabilisieren sich nicht - Verweise wären falsch")
 
     def _plan_once(self):
         self.sheets = []
@@ -743,9 +793,10 @@ class Document:
         if roots == 0:
             print("[WARNUNG] Keine Ressource im System gefunden - dokumentiere alle Projekttypen.",
                   file=sys.stderr)
+        # project types not reached from a resource, then the project's data types
         unused = [t for t in self.project.types.values()
-                  if t.key not in self.documented and t.kind not in ("DataType",)]
-        for t in sorted(unused, key=lambda t: t.full_name.lower()):
+                  if t.key not in self.documented and t.kind != "ResourceType"]
+        for t in sorted(unused, key=lambda t: (t.kind == "DataType", t.full_name.lower())):
             if t.key not in self.documented:
                 self._plan_type(t, path=t.name, level=0, unused=True)
         self._plan_appendix()
@@ -829,8 +880,6 @@ class Document:
         flow.heading("Inhaltsverzeichnis")
         rows = []
         for sheet in body:
-            if not sheet.outline:
-                continue
             rows.append([Cell(self.ref(sheet.key), sheet.key), Cell(sheet.title, sheet.key, indent=sheet.level),
                          Cell(sheet.subtitle)])
         flow.table([("Blatt", 1.2), ("Blattinhalt", 9), ("Hierarchie / Datei", 9)], rows, size=7)
@@ -841,7 +890,8 @@ class Document:
     def _plan_resource(self, sys_path: Path, system: ET.Element, device: ET.Element, resource: ET.Element):
         dev_name, res_name = device.get("Name", ""), resource.get("Name", "")
         path = f"{dev_name}.{res_name}"
-        key = f"res:{path}"
+        # system file in the key: several .sys files may contain the same device/resource names
+        key = f"res:{self.project.rel(sys_path)}:{path}"
         res_type = self.project.resolve(resource.get("Type", ""))
         mapped = self._mapped_elements(system, path)
         xml = self._resource_network_xml(res_name, resource, res_type, mapped)
@@ -870,9 +920,9 @@ class Document:
             flow.subheading("Zugeordnete Applikationselemente (Mapping)")
             flow.table([("Applikation", 4), ("Element", 4), ("Typ", 4)],
                        [[Cell(app), Cell(elem.get("Name", "")), Cell(elem.get("Type", "") or "(untypisiert)")]
-                        for app, elem in mapped])
+                        for app, elem, _ in mapped])
         segments = system.findall("Segment")
-        links = [l for l in system.findall("Link") if l.get("CommResource") == dev_name]
+        links = [l for l in system.findall("Link") if l.get("CommResource") in (dev_name, path)]
         if links:
             flow.subheading("Kommunikation")
             flow.table([("Segment", 4), ("Segmenttyp", 4), ("Kommentar", 6)],
@@ -884,7 +934,8 @@ class Document:
         self._recurse(info, path, net_sheet, 1)
 
     @staticmethod
-    def _mapped_elements(system: ET.Element, target: str) -> List[Tuple[str, ET.Element]]:
+    def _mapped_elements(system: ET.Element, target: str) -> List[Tuple[str, ET.Element, ET.Element]]:
+        """(application name, mapped element, network containing it) for each mapping to target."""
         found = []
         for mapping in system.findall("Mapping"):
             if mapping.get("To") != target:
@@ -892,20 +943,21 @@ class Document:
             app_name, _, elem_path = mapping.get("From", "").partition(".")
             app = next((a for a in system.findall("Application") if a.get("Name") == app_name), None)
             net = app.find("SubAppNetwork") if app is not None else None
-            elem = None
+            elem, parent = None, None
             for part in elem_path.split("."):
                 if net is None:
                     elem = None
                     break
+                parent = net
                 elem = next((e for e in list(net) if e.get("Name") == part and e.tag in ("FB", "SubApp")), None)
                 net = elem.find("SubAppNetwork") if elem is not None else None
             if elem is not None:
-                found.append((app_name, elem))
+                found.append((app_name, elem, parent))
         return found
 
     @staticmethod
     def _resource_network_xml(name: str, resource: ET.Element, res_type: Optional[TypeInfo],
-                              mapped: List[Tuple[str, ET.Element]]) -> str:
+                              mapped: List[Tuple[str, ET.Element, ET.Element]]) -> str:
         """The resource as 4diac shows it: resource-type FBs (START), the resource's own
         FB network, and the mapped application elements placed below them."""
         root = ET.Element("SubAppType", Name=name, Comment=resource.get("Comment", ""))
@@ -927,13 +979,24 @@ class Document:
                     target = conns.setdefault(elem.tag, ET.SubElement(net, elem.tag))
                     target.extend(list(elem))
         if mapped:
-            min_x = min(float(e.get("x", "0")) for _, e in mapped)
-            min_y = min(float(e.get("y", "0")) for _, e in mapped)
-            for _, elem in mapped:
+            min_x = min(float(e.get("x", "0")) for _, e, _ in mapped)
+            min_y = min(float(e.get("y", "0")) for _, e, _ in mapped)
+            for _, elem, _ in mapped:
                 copy = ET.fromstring(ET.tostring(elem))
                 copy.set("x", str(float(elem.get("x", "0")) - min_x + 100))
                 copy.set("y", str(float(elem.get("y", "0")) - min_y + max_y + 1200))
                 net.append(copy)
+            # application connections between mapped elements of the same network
+            for parent in {id(p): p for _, _, p in mapped}.values():
+                names = {e.get("Name") for _, e, p in mapped if p is parent}
+                for section in parent:
+                    if not section.tag.endswith("Connections"):
+                        continue
+                    for conn in section.findall("Connection"):
+                        ends = (conn.get("Source", ""), conn.get("Destination", ""))
+                        if all("." in e and e.split(".")[0] in names for e in ends):
+                            target = conns.setdefault(section.tag, ET.SubElement(net, section.tag))
+                            target.append(conn)
         return ET.tostring(root, encoding="unicode")
 
     # ----- types -----
@@ -941,7 +1004,12 @@ class Document:
     def _plan_type(self, t: TypeInfo, path: str, level: int, unused: bool = False):
         self.documented[t.key] = t
         label = KIND_LABELS.get(t.kind, t.kind)
-        subtitle = path if not unused else f"{self.project.rel(t.path)} (nicht in einer Ressource verwendet)"
+        if not unused:
+            subtitle = path
+        elif t.kind == "DataType":
+            subtitle = self.project.rel(t.path)
+        else:
+            subtitle = f"{self.project.rel(t.path)} (nicht in einer Ressource verwendet)"
         net_sheet = None
         if t.has_network:
             net_sheet = self._plan_network_sheet(t, f"{label} {t.name}", subtitle, path, level)
@@ -1048,9 +1116,11 @@ class Document:
         x, y, w, h = box
         return self.geometry(sheet.landscape).field_of(x + w / 2, y + h / 2)
 
-    def _usage_text(self, usages: List[Usage]) -> str:
-        return ", ".join(f"{self.ref(u.sheet_key)}/{u.field} ({u.instance})" if u.field
-                         else f"{self.ref(u.sheet_key)} ({u.instance})" for u in usages)
+    def _usage_cell(self, usages: List[Usage]) -> Cell:
+        """'S8/E3 (Klappen), S8/B4 (Verteiler)' - every item links to its network sheet."""
+        parts = [(f"{self.ref(u.sheet_key)}/{u.field} ({u.instance})" if u.field
+                  else f"{self.ref(u.sheet_key)} ({u.instance})", u.sheet_key) for u in usages]
+        return Cell(", ".join(text for text, _ in parts), parts=parts)
 
     def _instance_table(self, flow: Flow, t: TypeInfo, net_sheet: Sheet):
         rows = []
@@ -1117,7 +1187,7 @@ class Document:
         # usages of the previous planning pass: later instances are not known yet in this one
         usages = self.final_usages.get(t.key, [])
         if usages:
-            props.append([Cell("Verwendet in"), Cell(self._usage_text(usages))])
+            props.append([Cell("Verwendet in"), self._usage_cell(usages)])
         if props:
             flow.table([("Eigenschaft", 2.5), ("Wert", 12)], props)
 
@@ -1257,12 +1327,19 @@ class Document:
             rows = []
             for full, (t, usages) in sorted(self.lib_usages.items(), key=lambda kv: kv[0].lower()):
                 rows.append([Cell(full), Cell(t.library or ""), Cell(KIND_LABELS.get(t.kind, t.kind)),
-                             Cell(clean(t.root.get("Comment"))), Cell(self._usage_text(usages))])
+                             Cell(clean(t.root.get("Comment"))), self._usage_cell(usages)])
             flow.table([("Typ", 5), ("Bibliothek", 3), ("Art", 2.5), ("Kommentar", 5), ("Verwendet in", 6)], rows)
-            if self.missing:
-                flow.subheading("Nicht aufgelöste Typen")
-                flow.table([("Typ", 6), ("Verwendet in", 10)],
-                           [[Cell(k or "(leer)"), Cell(self._usage_text(v))] for k, v in sorted(self.missing.items())])
+            self._out.extend(flow.sheets)
+
+        if self.missing or self.project.warnings:
+            flow = Flow(self, make_maker("app:problems", "Nicht aufgelöste Typen"))
+            flow.heading("Nicht aufgelöste Typen und Hinweise")
+            for warning in self.project.warnings:
+                flow.para(warning)
+            flow.space()
+            flow.table([("Typ", 5), ("Grund", 7), ("Verwendet in", 6)],
+                       [[Cell(k or "(leer)"), Cell(self.project.problems.get(k, "nicht gefunden")), self._usage_cell(v)]
+                        for k, v in sorted(self.missing.items())])
             self._out.extend(flow.sheets)
 
         for path, gcf in self.project.global_constants:
@@ -1287,8 +1364,21 @@ class Document:
     # ----- rendering -----
 
     def render(self, output: Path):
+        """Write to a temporary file next to output and replace output only after a successful
+        save: a failed run keeps the previous PDF, and a symlink at output is replaced, not followed."""
+        fd, tmp = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+        os.close(fd)
+        try:
+            self._render_to(tmp)
+            os.replace(tmp, output)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _render_to(self, path: str):
         first = self.geometry(self.sheets[0].landscape)
-        c = canvas.Canvas(str(output), pagesize=(first.page_w, first.page_h))
+        c = canvas.Canvas(path, pagesize=(first.page_w, first.page_h))
         c.setTitle(f"{self.project_title} – Projektdokumentation")
         c.setAuthor(self.author or self.org)
         c.setSubject("Eclipse 4diac / IEC 61499 Projektdokumentation")
@@ -1417,15 +1507,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     init_fonts()
+    missing_libs = [p for p in args.lib if not Path(p).is_dir()]
+    if missing_libs:
+        sys.exit(f"[FEHLER] Bibliothek nicht gefunden: {', '.join(missing_libs)}")
     project = Project(find_project_dir(Path(args.project).resolve()), [Path(p) for p in args.lib])
+    for warning in project.warnings:
+        print(f"[WARNUNG] {warning}", file=sys.stderr)
     print(f"Projekt: {project.dir}")
     print(f"  {len(project.types)} Projekttypen, {len(project.systems)} System(e), "
           f"{len(project.lib_dirs)} Bibliotheken")
     doc = Document(project, args.paper, args.title)
     doc.plan()
+    for type_name in sorted(doc.missing):
+        print(f"[WARNUNG] Typ {type_name or '(leer)'}: {project.problems.get(type_name, 'nicht gefunden')}",
+              file=sys.stderr)
     output = Path(args.output) if args.output else default_output_dir(project.dir) / f"{project.name}_Dokumentation.pdf"
     output.parent.mkdir(parents=True, exist_ok=True)
-    doc.render(output)
+    try:
+        doc.render(output)
+    except PermissionError:
+        sys.exit(f"[FEHLER] {output} kann nicht ersetzt werden - ist das PDF noch in einem Viewer geöffnet?")
     print(f"PDF geschrieben: {output} ({doc.total()} Blatt)")
     return 0
 
