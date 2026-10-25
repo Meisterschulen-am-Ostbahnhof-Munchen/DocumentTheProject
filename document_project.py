@@ -477,11 +477,25 @@ VT_MASK_LABELS = {"CDataMask": "Datenmaske", "CAlarmMask": "Alarmmaske", "CSoftK
 VT_IMAGE_PREFIX = {"CDataMask": "screen_", "CAlarmMask": "am_", "CSoftKeyMask": "skm_"}
 
 
+VtRect = Tuple[float, float, float, float]   # x, y, w, h in VT pixels, y downwards
+
+
 @dataclass
 class VtImage:
-    reader: object      # ImageReader, held in memory: vt-render writes into a temporary folder
+    pil: object         # PIL image, held in memory: vt-render writes into a temporary folder
+    reader: object      # ImageReader of it
     width: int
     height: int
+
+    @classmethod
+    def of(cls, pil) -> "VtImage":
+        return cls(pil, ImageReader(pil), pil.width, pil.height)
+
+    def crop(self, rect: VtRect) -> Optional["VtImage"]:
+        x, y, w, h = (round(v) for v in rect)
+        if w <= 0 or h <= 0:
+            return None
+        return VtImage.of(self.pil.crop((x, y, x + w, y + h)))
 
 
 @dataclass
@@ -490,7 +504,15 @@ class VtObject:
     cls: str
     name: str
     depth: int = 0
-    pos: Optional[Tuple[float, float]] = None    # VT pixels in the image of the mask's sheet
+    rect: Optional[VtRect] = None   # in the image of the mask's sheet; children carry their top object's
+    own: bool = False               # rect is the object's own (top-level object or soft key)
+
+    @property
+    def pos(self) -> Optional[Tuple[float, float]]:
+        if self.rect is None:
+            return None
+        x, y, w, h = self.rect
+        return x + w / 2, y + h / 2
 
 
 @dataclass
@@ -566,8 +588,8 @@ class VtPool:
         path = (self.dir / rel) if rel else None
         return path if path is not None and path.exists() else None
 
-    def _components(self, jid: int) -> List[Tuple[int, Optional[Tuple[float, float]]]]:
-        """Top-level objects of a mask's .jvi in pool order, with the centre of each."""
+    def _components(self, jid: int) -> List[Tuple[int, Optional[VtRect]]]:
+        """Top-level objects of a mask's .jvi in pool order, with the rectangle of each."""
         jvi = self._jvi(jid)
         if jvi is None:
             return [(c, None) for c in self.children.get(jid, [])]
@@ -580,7 +602,7 @@ class VtPool:
             for o in comp.findall("./Objects/Object"):
                 oid = int(o.get("JVS-ID"))
                 w, h = self.sizes.get(oid, (0, 0))
-                positions[oid] = (float(left.text) + w / 2, float(top.text) + h / 2)
+                positions[oid] = (float(left.text), float(top.text), w, h)
         return [(c, positions.get(c)) for c in self.lmo.jvi_component_roots(str(jvi))]
 
     def _define(self, name: str) -> Optional[int]:
@@ -634,7 +656,7 @@ class VtPool:
             for entry in self.manifest.get("images", []):
                 with Image.open(out / entry["file"]) as img:
                     img.load()
-                    self.images[entry["file"]] = VtImage(ImageReader(img.copy()), img.width, img.height)
+                    self.images[entry["file"]] = VtImage.of(img.convert("RGB"))
 
     # ----- masks -----
 
@@ -659,22 +681,22 @@ class VtPool:
 
     @staticmethod
     def _key_positions(components, settings: dict, x0: float):
-        """Key centres as the VT lays them out: columns filled top to bottom, right column first."""
+        """Key rectangles as the VT lays them out: columns filled top to bottom, right column first."""
         rows, cols = settings.get("softkey_rows", 0), settings.get("softkey_columns", 0)
         pad, w, h = (settings.get(k, 0) for k in ("softkey_padding", "softkey_width", "softkey_height"))
         out = []
         for i, (jid, _) in enumerate(components):
-            pos = None
+            rect = None
             if rows and cols and i < rows * cols:
                 col, row = cols - 1 - i // rows, i % rows
-                pos = (x0 + pad + col * (w + pad) + w / 2, pad + row * (h + pad) + h / 2)
-            out.append((jid, pos))
+                rect = (x0 + pad + col * (w + pad), pad + row * (h + pad), w, h)
+            out.append((jid, rect))
         return out
 
     def _tree(self, components) -> List[VtObject]:
         """All objects reachable from the mask's top-level objects; CProxy hops are left out."""
         objects: List[VtObject] = []
-        for jid, pos in components:
+        for jid, rect in components:
             shown: Dict[int, int] = {}
             for depth, child in self.lmo.resolve_tree([jid], self.children, set()):
                 level = shown.get(depth - 1, 0) if depth else 0
@@ -682,7 +704,8 @@ class VtPool:
                     shown[depth] = level
                     continue
                 shown[depth] = level + 1
-                objects.append(VtObject(child, self.cls.get(child, "?"), self.names.get(child, ""), level, pos))
+                objects.append(VtObject(child, self.cls.get(child, "?"), self.names.get(child, ""), level, rect,
+                                        own=child == jid))
         return objects
 
     def lookup(self, value: str, numeric: bool) -> Optional[int]:
@@ -723,6 +746,8 @@ class Cell:
     font: Optional[str] = None
     indent: int = 0                # indentation steps (table of contents)
     parts: Optional[List[Tuple[str, Optional[str]]]] = None   # ", "-separated items with own links
+    image: Optional["VtImage"] = None   # drawn instead of text, image_h high
+    image_h: float = 0.0
 
     def lines(self, size: float, width: float) -> List[List[Tuple[str, Optional[str], float]]]:
         """Wrapped lines as segments (text, link, x offset)."""
@@ -875,8 +900,9 @@ class Flow:
         pad = 1.2 * mm
         lead = size * 1.25
 
-        def height(wrapped) -> float:
-            return max(len(lines) for lines in wrapped) * lead + 2 * pad - (lead - size)
+        def height(wrapped, cells: List[Cell] = ()) -> float:
+            text = max(len(lines) for lines in wrapped) * lead + 2 * pad - (lead - size)
+            return max([text] + [cell.image_h + 2 * pad for cell in cells if cell.image is not None])
 
         header = [Cell(t) for t, _ in columns]
         hw = [cell.lines(size, w - 2 * pad) for cell, w in zip(header, widths)]
@@ -885,7 +911,7 @@ class Flow:
         max_lines = max(1, int((self.geo.area.h - hh - 2 * pad + (lead - size)) / lead))
 
         def emit(cells: List[Cell], wrapped, is_header: bool):
-            h = height(wrapped)
+            h = height(wrapped, cells)
             x0, y0 = self.geo.area.x, self.y - h
             items = list(zip(cells, wrapped, widths))
             self.sheet.ops.append(lambda c, d: _table_row(c, x0, y0, h, items, size, lead, pad, is_header))
@@ -897,7 +923,7 @@ class Flow:
             n = max(len(lines) for lines in full)
             for start in range(0, n, max_lines):
                 wrapped = [lines[start:start + max_lines] or [[]] for lines in full]
-                h = height(wrapped)
+                h = height(wrapped, row)
                 if first:
                     self._need(hh + h)
                     emit(header, hw, True)
@@ -960,6 +986,10 @@ def _table_row(c, x, y, h, items, size, lead, pad, is_header):
         c.rect(x, y, sum(w for _, _, w in items), h, stroke=0, fill=1)
     cx = x
     for cell, lines, w in items:
+        if cell.image is not None:
+            img = cell.image
+            s = min(cell.image_h / img.height, (w - 2 * pad) / img.width)
+            c.drawImage(img.reader, cx + pad, y + h - pad - img.height * s, img.width * s, img.height * s)
         font = cell.font or FONT
         ty = y + h - pad - size
         for line in lines:
@@ -1690,6 +1720,14 @@ class Document:
             for i, obj in enumerate(mask.objects):
                 if obj.pos is not None:
                     fields[i] = geo.field_of(x + obj.pos[0] * scale, y + h - obj.pos[1] * scale)
+                if obj.own and obj.rect is not None:
+                    # clicking a key or button in the image jumps to the 4diac block using it,
+                    # else to the object table
+                    usages = self.vt_usages.get(obj.id)
+                    target = usages[0].sheet_key if usages else f"{key}#objects"
+                    rx, ry, rw, rh = obj.rect
+                    sheet.ops.append(lambda c, d, r=(x + rx * scale, y + h - (ry + rh) * scale, rw * scale,
+                                                     rh * scale), t=target: _link(c, t, *r))
         self._out.append(sheet)
 
         flow = self._vt_flow(f"{key}#objects", f"{mask.name or mask.id} – Objekte", subtitle, 2)
@@ -1698,10 +1736,13 @@ class Document:
         for i, obj in enumerate(mask.objects):
             where = Cell(f"{self.ref(key)}/{fields[i]}", key) if i in fields else Cell("")
             link = f"vt:{obj.id}" if obj.cls in VT_MASK_LABELS else None
-            rows.append([Cell(str(obj.id)), Cell(obj.name, link, indent=obj.depth),
+            thumb = img.crop(obj.rect) if img is not None and obj.own and obj.rect is not None else None
+            rows.append([Cell(str(obj.id)), Cell("", image=thumb, image_h=9 * mm),
+                         Cell(obj.name, link, indent=obj.depth),
                          Cell(obj.cls[1:] if obj.cls.startswith("C") else obj.cls), where,
                          self._vt_usage_cell(obj.id)])
-        flow.table([("ID", 1.2), ("Name", 5), ("Klasse", 2.5), ("Blatt/Feld", 1.4), ("Verwendet in (4diac)", 7)], rows)
+        flow.table([("ID", 1.2), ("Bild", 2.2), ("Name", 5), ("Klasse", 2.3), ("Blatt/Feld", 1.4),
+                    ("Verwendet in (4diac)", 7)], rows)
         self._out.extend(flow.sheets)
 
     # ----- appendix -----
