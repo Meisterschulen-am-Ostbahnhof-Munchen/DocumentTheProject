@@ -274,6 +274,7 @@ class Project:
         self.types_by_short: Dict[str, List[TypeInfo]] = {}
         self._lib_files: Optional[Dict[str, List[Tuple[str, Path]]]] = None
         self._lib_cache: Dict[Path, Optional[TypeInfo]] = {}
+        self._identifiers: Optional[set] = None
         self.systems: List[Tuple[Path, ET.Element]] = []
         self.global_constants: List[Tuple[Path, ET.Element]] = []
         self._scan()
@@ -344,6 +345,23 @@ class Project:
                 root = self._read_xml(path)
                 if root is not None:
                     self.global_constants.append((path, root))
+
+    def identifiers(self) -> set:
+        """Every name used in a parameter value, initial value or ST code of the project's
+        types and systems, e.g. to tell which global constants are used."""
+        if self._identifiers is None:
+            names = set()
+            roots = [t.root for t in self.types.values()] + [root for _, root in self.systems]
+            for root in roots:
+                for elem in root.iter():
+                    texts = [elem.get("Value"), elem.get("InitialValue")]
+                    if elem.tag == "ST":
+                        texts += [elem.get("Text"), elem.text]
+                    for text in texts:
+                        if text:
+                            names.update(re.findall(r"[A-Za-z_]\w*", text))
+            self._identifiers = names
+        return self._identifiers
 
     def _index_libs(self):
         self._lib_files = {}
@@ -748,6 +766,7 @@ class Cell:
     parts: Optional[List[Tuple[str, Optional[str]]]] = None   # ", "-separated items with own links
     image: Optional["VtImage"] = None   # drawn instead of text, image_h high
     image_h: float = 0.0
+    bold: bool = False             # TGL has no bold face: drawn with an outline
 
     def lines(self, size: float, width: float) -> List[List[Tuple[str, Optional[str], float]]]:
         """Wrapped lines as segments (text, link, x offset)."""
@@ -995,6 +1014,19 @@ def _table_row(c, x, y, h, items, size, lead, pad, is_header):
         for line in lines:
             for text, link, dx in line:
                 tx = cx + pad + cell.indent * INDENT + dx
+                if cell.bold:
+                    # the text render mode outlives the text object: keep it inside a saved state
+                    c.saveState()
+                    c.setStrokeColor(LINK if link else INK)
+                    c.setFillColor(LINK if link else INK)
+                    c.setLineWidth(size * 0.06)
+                    t = c.beginText(tx, ty)
+                    t.setFont(font, size)
+                    t.setTextRenderMode(2)   # fill and stroke
+                    t.textOut(text)
+                    c.drawText(t)
+                    c.restoreState()
+                    continue
                 _text(c, tx, ty, text, font, size, LINK if link else INK)
                 if link and cell.parts is not None:
                     _link(c, link, tx, ty - 1.5, pdfmetrics.stringWidth(text, font, size), size + 2.5)
@@ -1784,9 +1816,13 @@ class Document:
             flow = Flow(self, make_maker(f"app:gcf:{name}", f"Globale Konstanten {name}"))
             flow.heading(f"Globale Konstanten {name}")
             flow.para(self.project.rel(path), color=GREY)
+            used = self.project.identifiers()
+            decls = list(gcf.iter("VarDeclaration"))
+            flow.para(f"Fett: im Projekt verwendet ({sum(v.get('Name') in used for v in decls)} von {len(decls)}).",
+                      color=GREY)
             flow.space()
-            rows = [[Cell(v.get("Name", "")), Cell(self._var_type(v)), Cell(v.get("InitialValue", "")),
-                     Cell(clean(v.get("Comment")))] for v in gcf.iter("VarDeclaration")]
+            rows = [[Cell(v.get("Name", ""), bold=v.get("Name") in used), Cell(self._var_type(v)),
+                     Cell(v.get("InitialValue", "")), Cell(clean(v.get("Comment")))] for v in decls]
             flow.table([("Name", 6), ("Typ", 2), ("Wert", 3), ("Kommentar", 6)], rows)
             self._out.extend(flow.sheets)
 
