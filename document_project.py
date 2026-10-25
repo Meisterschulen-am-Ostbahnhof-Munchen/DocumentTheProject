@@ -1612,8 +1612,7 @@ class Document:
         return Flow(self, make)
 
     def _vt_usage_cell(self, oid: int) -> Cell:
-        usages = self.vt_usages.get(oid, [])
-        return Cell(self._usage_text(usages), usages[0].sheet_key if usages else None)
+        return self._usage_cell(self.vt_usages.get(oid, []))
 
     def _plan_vt(self):
         vt = self.vt
