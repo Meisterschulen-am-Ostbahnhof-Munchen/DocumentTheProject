@@ -1109,6 +1109,9 @@ class Document:
         self.lib_usages: Dict[str, Tuple[TypeInfo, List[Usage]]] = {}
         self.missing: Dict[str, List[Usage]] = {}
         self.vt_usages: Dict[int, List[Usage]] = {}
+        self.const_usages: Dict[str, List[Usage]] = {}
+        self.const_names = {v.get("Name") for _, gcf in self.project.global_constants
+                            for v in gcf.iter("VarDeclaration")}
 
         body: List[Sheet] = []
         self._out = body
@@ -1468,6 +1471,9 @@ class Document:
             else:
                 ref = Cell("nicht gefunden")
                 type_cell = Cell(elem.get("Type", ""))
+            for p in elem.findall("Parameter"):
+                for const in self._constants_in(p.get("Value")):
+                    self.const_usages.setdefault(const, []).append(Usage(net_sheet.key, name, field_))
             vt_ids = self._vt_refs(elem)
             for oid in vt_ids:
                 self.vt_usages.setdefault(oid, []).append(Usage(net_sheet.key, name, field_))
@@ -1489,6 +1495,28 @@ class Document:
             flow.subheading("Gruppen")
             flow.table([("Gruppe", 3), ("Kommentar", 9)],
                        [[Cell(g.get("Name", "")), Cell(clean(g.get("Comment")))] for g in groups])
+
+    def _constants_in(self, text: Optional[str]) -> List[str]:
+        if not text or not self.const_names:
+            return []
+        return list(dict.fromkeys(n for n in re.findall(r"[A-Za-z_]\w*", text) if n in self.const_names))
+
+    def _type_constant_usages(self):
+        """Global constants in ST code and initial values: they point to the type's interface sheet
+        (parameters of instances are collected by _instance_table)."""
+        for t in self.documented.values():
+            if t.kind == "Resource":
+                continue
+            key = f"{t.key}#details" if t.has_network else t.key
+            found: List[str] = []
+            for elem in t.root.iter():
+                texts = [elem.get("InitialValue")]
+                if elem.tag == "ST":
+                    texts += [elem.get("Text"), elem.text]
+                for text in texts:
+                    found += self._constants_in(text)
+            for const in dict.fromkeys(found):
+                self.const_usages.setdefault(const, []).append(Usage(key, t.name))
 
     def _vt_refs(self, elem: ET.Element) -> List[int]:
         """VT objects named in the instance's parameters, e.g. QI := SoftKey_Licht."""
@@ -1811,6 +1839,7 @@ class Document:
                         for k, v in sorted(self.missing.items())])
             self._out.extend(flow.sheets)
 
+        self._type_constant_usages()
         for path, gcf in self.project.global_constants:
             name = gcf.get("Name", path.stem)
             flow = Flow(self, make_maker(f"app:gcf:{name}", f"Globale Konstanten {name}"))
@@ -1822,8 +1851,9 @@ class Document:
                       color=GREY)
             flow.space()
             rows = [[Cell(v.get("Name", ""), bold=v.get("Name") in used), Cell(self._var_type(v)),
-                     Cell(v.get("InitialValue", "")), Cell(clean(v.get("Comment")))] for v in decls]
-            flow.table([("Name", 6), ("Typ", 2), ("Wert", 3), ("Kommentar", 6)], rows)
+                     Cell(v.get("InitialValue", "")), Cell(clean(v.get("Comment"))),
+                     self._usage_cell(self.const_usages.get(v.get("Name"), []))] for v in decls]
+            flow.table([("Name", 5), ("Typ", 1.5), ("Wert", 2), ("Kommentar", 4), ("Verwendet in", 6)], rows)
             self._out.extend(flow.sheets)
 
         deps = self.project.manifest.find("Dependencies") if self.project.manifest is not None else None
