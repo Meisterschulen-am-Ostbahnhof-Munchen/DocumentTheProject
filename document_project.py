@@ -28,6 +28,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 __version__ = "0.1.0"
 
@@ -308,6 +310,11 @@ class Project:
             for _ in range(int(m.group(1))):
                 base = base.parent
             return base / m.group(2)
+        if uri.startswith("file:"):
+            # Eclipse writes file:/C:/lib or file:///C:/lib
+            return Path(url2pathname(urlparse(uri).path))
+        if uri and Path(uri).is_absolute():
+            return Path(uri)
         return None
 
     def _scan(self):
