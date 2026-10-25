@@ -15,13 +15,22 @@ Feldeinteilung 1..n / A..x) und ein Schriftfeld mit Blattnummer "Blatt n von m".
 Die Netzwerk- und Schnittstellengrafiken erzeugt der Konverter aus
 IEC61499_FunctionBlock_SVG; das PDF wird mit reportlab + svglib gebaut
 (wie in training1_cards).
+
+Optional kommt ein Kapitel "Bedienoberfläche" dazu: die Masken des ISOBUS-
+Objektpools als Bild (vt-render aus AgIsoVirtualTerminal) mit Objekttabellen
+(list_mask_objects.py aus scripts_central) und Querverweisen auf die
+4diac-Instanzen, die die Objekte verwenden.
+
+Alle Pfade kommen als Parameter (siehe generate_doc.bat), keiner steht hier.
 """
 
 import argparse
 import datetime
+import hashlib
 import io
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -31,25 +40,24 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-__version__ = "0.1.0"
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SVG_TOOL = SCRIPT_DIR.parent / "IEC61499_FunctionBlock_SVG"
-DEFAULT_PROJECT = (SCRIPT_DIR.parent / "4diac-SlurryTanker_AX-sample" / "Ventilsteuerung"
-                   / "4diacIDE-workspace" / "test")
+__version__ = "0.2.0"
 
 
-def _locate_svg_tool(argv: List[str]) -> Path:
+def _locate_svg_tool(argv: List[str]) -> Optional[Path]:
     """The converter path is needed before argparse runs (module import)."""
     for i, arg in enumerate(argv):
         if arg == "--svg-tool" and i + 1 < len(argv):
             return Path(argv[i + 1])
         if arg.startswith("--svg-tool="):
             return Path(arg.split("=", 1)[1])
-    return Path(os.environ.get("IEC61499_SVG_TOOL", DEFAULT_SVG_TOOL))
+    env = os.environ.get("IEC61499_SVG_TOOL")
+    return Path(env) if env else None
 
 
 SVG_TOOL_DIR = _locate_svg_tool(sys.argv)
+if SVG_TOOL_DIR is None:
+    sys.exit("[FEHLER] Pfad zu IEC61499_FunctionBlock_SVG fehlt: --svg-tool <Pfad> "
+             "oder Umgebungsvariable IEC61499_SVG_TOOL angeben (siehe generate_doc.bat).")
 if str(SVG_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(SVG_TOOL_DIR))
 
@@ -63,6 +71,7 @@ except ImportError as exc:  # pragma: no cover - environment problem
 from reportlab.graphics import renderPDF
 from reportlab.lib import colors
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
@@ -461,6 +470,237 @@ class DiagramFactory:
 
 
 # ===========================================================================
+# ISOBUS object pool (VT GUI)
+# ===========================================================================
+
+VT_MASK_LABELS = {"CDataMask": "Datenmaske", "CAlarmMask": "Alarmmaske", "CSoftKeyMask": "Soft-Key-Maske"}
+VT_IMAGE_PREFIX = {"CDataMask": "screen_", "CAlarmMask": "am_", "CSoftKeyMask": "skm_"}
+
+
+@dataclass
+class VtImage:
+    reader: object      # ImageReader, held in memory: vt-render writes into a temporary folder
+    width: int
+    height: int
+
+
+@dataclass
+class VtObject:
+    id: int
+    cls: str
+    name: str
+    depth: int = 0
+    pos: Optional[Tuple[float, float]] = None    # VT pixels in the image of the mask's sheet
+
+
+@dataclass
+class VtMask:
+    id: int
+    cls: str
+    name: str
+    image: Optional[VtImage] = None
+    objects: List[VtObject] = field(default_factory=list)
+    soft_key_mask: Optional[int] = None
+
+
+class VtPool:
+    """An ISO-Designer object pool: object tree from list_mask_objects.py,
+    mask images from vt-render."""
+
+    def __init__(self, pool_dir: Path, scripts_dir: Path, vt_render: Optional[Path],
+                 softkeys: Optional[int], mask_size: Optional[int], title: str, org: str):
+        sys.path.insert(0, str(scripts_dir))
+        import list_mask_objects as lmo
+        self.lmo = lmo
+        jops = sorted(pool_dir.glob("*.jop"))
+        if len(jops) != 1:
+            raise ValueError(f"{pool_dir}: genau eine .jop-Datei erwartet, gefunden {len(jops)}")
+        self.dir = pool_dir
+        self.jop = jops[0]
+        self.iop = pool_dir / "Output" / f"{self.jop.stem}.iop"
+        (self.cls, self.names, self.children, self.paths, _, _) = lmo.load_pool(str(self.jop))
+        self.sizes = self._sizes(self.jop)
+        self.ids_by_name = {n: i for i, n in sorted(self.names.items()) if n}
+        self.manifest: dict = {}
+        self.images: Dict[str, VtImage] = {}
+        self.render_error = ""
+
+        roots = {jid: self._components(jid) for jid, c in self.cls.items() if c in VT_MASK_LABELS}
+        key_counts = [len(r) for jid, r in roots.items() if self.cls[jid] == "CSoftKeyMask"]
+        softkeys = softkeys or (max(key_counts) if key_counts else None)
+        mask_size = mask_size or self._define("ISO_MASK_SIZE")
+        if vt_render is not None:
+            self._render(vt_render, softkeys, mask_size, title, org)
+        settings = self.manifest.get("render_settings", {})
+        self.mask_size = settings.get("data_mask_size", mask_size or 480)
+
+        self.masks: List[VtMask] = []
+        for cls in ("CDataMask", "CAlarmMask", "CSoftKeyMask"):
+            for jid in sorted(j for j, c in self.cls.items() if c == cls):
+                self.masks.append(self._mask(jid, roots[jid], roots, settings))
+        # the sheet an object is documented on: soft keys on their soft key mask, the rest on its mask
+        self.home: Dict[int, int] = {}
+        for mask in sorted(self.masks, key=lambda m: m.cls != "CSoftKeyMask"):
+            for obj in mask.objects:
+                self.home.setdefault(obj.id, mask.id)
+        self.aux = [jid for jid in sorted(self.cls) if self.cls[jid] == "CAuxFunction"]
+
+    # ----- ISO-Designer files -----
+
+    @staticmethod
+    def _sizes(jop: Path) -> Dict[int, Tuple[int, int]]:
+        sizes = {}
+        for obj in ET.parse(jop).getroot().iter("Object"):
+            jid = obj.get("JVS-ID")
+            w = obj.find("./PropertySheet/Property[@Name='Width']/Value")
+            h = obj.find("./PropertySheet/Property[@Name='Height']/Value")
+            if jid is not None and w is not None and h is not None:
+                try:
+                    sizes[int(jid)] = (int(float(w.text)), int(float(h.text)))
+                except (TypeError, ValueError):
+                    pass
+        return sizes
+
+    def _jvi(self, jid: int) -> Optional[Path]:
+        rel = self.paths.get(jid)
+        path = (self.dir / rel) if rel else None
+        return path if path is not None and path.exists() else None
+
+    def _components(self, jid: int) -> List[Tuple[int, Optional[Tuple[float, float]]]]:
+        """Top-level objects of a mask's .jvi in pool order, with the centre of each."""
+        jvi = self._jvi(jid)
+        if jvi is None:
+            return [(c, None) for c in self.children.get(jid, [])]
+        positions = {}
+        for comp in ET.parse(jvi).getroot().iter("Component"):
+            left = comp.find("./PropertySheets/PropertySheet[@Name='Proxy']/Property[@Name='Left']/Value")
+            top = comp.find("./PropertySheets/PropertySheet[@Name='Proxy']/Property[@Name='Top']/Value")
+            if left is None or top is None:
+                continue
+            for o in comp.findall("./Objects/Object"):
+                oid = int(o.get("JVS-ID"))
+                w, h = self.sizes.get(oid, (0, 0))
+                positions[oid] = (float(left.text) + w / 2, float(top.text) + h / 2)
+        return [(c, positions.get(c)) for c in self.lmo.jvi_component_roots(str(jvi))]
+
+    def _define(self, name: str) -> Optional[int]:
+        header = self.iop.with_name(self.iop.name + ".h")
+        if header.exists():
+            m = re.search(rf"#define\s+{name}\s+(\d+)", header.read_text(encoding="latin-1"))
+            if m:
+                return int(m.group(1))
+        return None
+
+    # ----- vt-render -----
+
+    def _render(self, exe: Path, softkeys: Optional[int], mask_size: Optional[int], title: str, org: str):
+        if not self.iop.exists():
+            self.render_error = f"{self.iop} fehlt (Pool im ISO-Designer übersetzen)"
+            return
+        data = self.iop.read_bytes()
+        with tempfile.TemporaryDirectory(prefix="vt-render-") as tmp:
+            meta = Path(tmp) / "meta.yaml"
+            meta.write_text("\n".join([
+                f'id: "{hashlib.sha256(data).hexdigest()[:8]}"',
+                f"name: {title}",
+                f"manufacturer: {org or 'TODO'}",
+                "public: false",
+                "render:",
+                f"  data_mask_size: {mask_size or 'TODO'}",
+                f"  softkey_count: {softkeys or 'TODO'}",
+                "  softkey_width: TODO",
+                "  softkey_height: TODO",
+                "known_issues:", ""]), encoding="utf-8")
+            out = Path(tmp) / "out"
+            try:
+                proc = subprocess.run([str(exe), "--pool", str(self.iop), "--meta", str(meta), "--out", str(out)],
+                                      capture_output=True, text=True, timeout=300)
+            except OSError as exc:
+                self.render_error = f"vt-render konnte nicht gestartet werden: {exc}"
+                return
+            print(f"  vt-render: {proc.stdout.strip() or proc.stderr.strip()}")
+            try:
+                import json
+                self.manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                self.render_error = f"vt-render (Exit-Code {proc.returncode}): kein manifest.json ({exc})"
+                return
+            load = self.manifest.get("load", {})
+            if not load.get("ok"):
+                self.render_error = f"vt-render konnte den Pool nicht laden: {load.get('error')}"
+            for err in self.manifest.get("errors", []):
+                print(f"[WARNUNG] vt-render {err.get('file')}: {err.get('error')}", file=sys.stderr)
+            from PIL import Image
+            for entry in self.manifest.get("images", []):
+                with Image.open(out / entry["file"]) as img:
+                    img.load()
+                    self.images[entry["file"]] = VtImage(ImageReader(img.copy()), img.width, img.height)
+
+    # ----- masks -----
+
+    def _mask(self, jid: int, components, roots, settings: dict) -> VtMask:
+        cls = self.cls[jid]
+        mask = VtMask(jid, cls, self.names.get(jid, ""), self.images.get(f"{VT_IMAGE_PREFIX[cls]}{jid}.png"))
+        if cls == "CSoftKeyMask":
+            mask.objects = self._tree(self._key_positions(components, settings, 0))
+            return mask
+        mask.objects = self._tree(components)
+        jvi = self._jvi(jid)
+        skm = self.lmo.jvi_softkeymask_id(str(jvi)) if jvi is not None else None
+        if skm is not None and self.cls.get(skm) == "CSoftKeyMask":
+            mask.soft_key_mask = skm
+            if cls == "CDataMask":
+                # the screen image shows the soft key mask right of the data mask
+                keys = self._tree(self._key_positions(roots[skm], settings, self.mask_size))
+                for obj in keys:
+                    obj.depth += 1
+                mask.objects += [VtObject(skm, "CSoftKeyMask", self.names.get(skm, ""))] + keys
+        return mask
+
+    @staticmethod
+    def _key_positions(components, settings: dict, x0: float):
+        """Key centres as the VT lays them out: columns filled top to bottom, right column first."""
+        rows, cols = settings.get("softkey_rows", 0), settings.get("softkey_columns", 0)
+        pad, w, h = (settings.get(k, 0) for k in ("softkey_padding", "softkey_width", "softkey_height"))
+        out = []
+        for i, (jid, _) in enumerate(components):
+            pos = None
+            if rows and cols and i < rows * cols:
+                col, row = cols - 1 - i // rows, i % rows
+                pos = (x0 + pad + col * (w + pad) + w / 2, pad + row * (h + pad) + h / 2)
+            out.append((jid, pos))
+        return out
+
+    def _tree(self, components) -> List[VtObject]:
+        """All objects reachable from the mask's top-level objects; CProxy hops are left out."""
+        objects: List[VtObject] = []
+        for jid, pos in components:
+            shown: Dict[int, int] = {}
+            for depth, child in self.lmo.resolve_tree([jid], self.children, set()):
+                level = shown.get(depth - 1, 0) if depth else 0
+                if self.cls.get(child) == "CProxy":
+                    shown[depth] = level
+                    continue
+                shown[depth] = level + 1
+                objects.append(VtObject(child, self.cls.get(child, "?"), self.names.get(child, ""), level, pos))
+        return objects
+
+    def lookup(self, value: str, numeric: bool) -> Optional[int]:
+        """Object id a 4diac parameter value refers to: an object name, or (numeric) a plain
+        object id; plain numbers only count on ISOBUS blocks, elsewhere they are times, limits, ..."""
+        value = value.strip().strip("'\"").split("#")[-1]
+        if value in self.ids_by_name:
+            return self.ids_by_name[value]
+        if numeric and value.isdigit() and int(value) in self.cls and int(value) != 0:
+            return int(value)
+        return None
+
+    def label(self, jid: int) -> str:
+        name = self.names.get(jid, "")
+        return f"{name} ({jid})" if name else str(jid)
+
+
+# ===========================================================================
 # Sheet layout primitives
 # ===========================================================================
 
@@ -616,6 +856,16 @@ class Flow:
         self.sheet.ops.append(lambda c, d: _draw_diagram(c, diagram, x, y, scale))
         self.y = y - 3 * mm
 
+    def image(self, img: Optional[VtImage], max_h: float, max_scale: float = 1.0):
+        if img is None:
+            return
+        scale = min(self.width / img.width, max_h / img.height, max_scale)
+        w, h = img.width * scale, img.height * scale
+        self._need(h + 2 * mm)
+        x, y = self.geo.area.x, self.y - h
+        self.sheet.ops.append(lambda c, d: _draw_image(c, img, x, y, w, h))
+        self.y = y - 3 * mm
+
     def table(self, columns: List[Tuple[str, float]], rows: List[List[Cell]], size: float = 6.8):
         """columns: (title, relative width)."""
         if not rows:
@@ -697,6 +947,13 @@ def _draw_diagram(c, diagram: Diagram, x, y, scale):
     c.restoreState()
 
 
+def _draw_image(c, img: VtImage, x, y, w, h):
+    c.drawImage(img.reader, x, y, w, h)
+    c.setStrokeColor(GREY)
+    c.setLineWidth(0.3)
+    c.rect(x, y, w, h, stroke=1, fill=0)
+
+
 def _table_row(c, x, y, h, items, size, lead, pad, is_header):
     if is_header:
         c.setFillColor(LIGHT)
@@ -732,9 +989,10 @@ class Usage:
 
 
 class Document:
-    def __init__(self, project: Project, paper: str, title: Optional[str]):
+    def __init__(self, project: Project, paper: str, title: Optional[str], vt: Optional[VtPool] = None):
         self.project = project
         self.paper = paper
+        self.vt = vt
         self.diagrams = DiagramFactory(project)
         self.custom_title = title
         self.sheets: List[Sheet] = []
@@ -788,6 +1046,7 @@ class Document:
         self.usages: Dict[str, List[Usage]] = {}
         self.lib_usages: Dict[str, Tuple[TypeInfo, List[Usage]]] = {}
         self.missing: Dict[str, List[Usage]] = {}
+        self.vt_usages: Dict[int, List[Usage]] = {}
 
         body: List[Sheet] = []
         self._out = body
@@ -806,6 +1065,9 @@ class Document:
         for t in sorted(unused, key=lambda t: (t.kind == "DataType", t.full_name.lower())):
             if t.key not in self.documented:
                 self._plan_type(t, path=t.name, level=0, unused=True)
+        if self.vt is not None:
+            # after all networks: their instance tables collect the VT object usages
+            self._plan_vt()
         self._plan_appendix()
         self.final_usages = self.usages
 
@@ -1144,6 +1406,12 @@ class Document:
             else:
                 ref = Cell("nicht gefunden")
                 type_cell = Cell(elem.get("Type", ""))
+            vt_ids = self._vt_refs(elem)
+            for oid in vt_ids:
+                self.vt_usages.setdefault(oid, []).append(Usage(net_sheet.key, name, field_))
+            if vt_ids and (child is None or child.library is not None):
+                key = self._vt_key(vt_ids[0])
+                ref = Cell(f"{ref.text}, VT {self.ref(key)}".lstrip(", "), key)
             where = Cell(f"{self.ref(net_sheet.key)}/{field_}", net_sheet.key) if field_ else Cell("")
             rows.append([Cell(name), where, type_cell, Cell(params), ref])
             # instance -> type reference next to the block on the network sheet
@@ -1159,6 +1427,22 @@ class Document:
             flow.subheading("Gruppen")
             flow.table([("Gruppe", 3), ("Kommentar", 9)],
                        [[Cell(g.get("Name", "")), Cell(clean(g.get("Comment")))] for g in groups])
+
+    def _vt_refs(self, elem: ET.Element) -> List[int]:
+        """VT objects named in the instance's parameters, e.g. QI := SoftKey_Licht."""
+        if self.vt is None:
+            return []
+        numeric = "isobus" in elem.get("Type", "").lower()
+        ids = [self.vt.lookup(p.get("Value", ""), numeric) for p in elem.findall("Parameter")]
+        return [i for i in dict.fromkeys(ids) if i is not None]
+
+    def _vt_key(self, oid: int) -> str:
+        if self.vt is None:
+            return "vt:pool"
+        if self.vt.cls.get(oid) in VT_MASK_LABELS:
+            return f"vt:{oid}"
+        home = self.vt.home.get(oid)
+        return f"vt:{home}" if home is not None else "vt:pool"
 
     def _instance_ref_op(self, box, key):
         x, y, w, h = box
@@ -1314,6 +1598,112 @@ class Document:
             flow.subheading(f"Algorithmus {alg.get('Name', '')}" +
                             (f" – {clean(alg.get('Comment'))}" if clean(alg.get("Comment")) else ""))
             flow.code(text or "(leer)")
+
+    # ----- VT GUI -----
+
+    def _vt_flow(self, key: str, title: str, subtitle: str, level: int) -> Flow:
+        sheets: List[Sheet] = []
+
+        def make(first: bool) -> Sheet:
+            s = Sheet(key if first else f"{key}#{len(sheets)}", title if first else f"{title} (Forts.)",
+                      subtitle, level=level, outline=first)
+            sheets.append(s)
+            return s
+        return Flow(self, make)
+
+    def _vt_usage_cell(self, oid: int) -> Cell:
+        usages = self.vt_usages.get(oid, [])
+        return Cell(self._usage_text(usages), usages[0].sheet_key if usages else None)
+
+    def _plan_vt(self):
+        vt = self.vt
+        flow = self._vt_flow("vt:pool", "Bedienoberfläche (ISOBUS-VT)", clean(str(vt.dir)), 0)
+        flow.heading("Bedienoberfläche – ISOBUS-Objektpool")
+        props = [[Cell("Pool (ISO-Designer)"), Cell(clean(str(vt.jop)))],
+                 [Cell("Pool (übersetzt)"), Cell(clean(str(vt.iop)))]]
+        m = vt.manifest
+        if m:
+            s = m.get("render_settings", {})
+            props += [
+                [Cell("SHA-256"), Cell(f"{m.get('pool_sha256', '')} ({m.get('pool_size', '')} Byte)")],
+                [Cell("Datenmaske"), Cell(f"{s.get('data_mask_size')} x {s.get('data_mask_size')} Pixel")],
+                [Cell("Soft-Keys"), Cell(f"{s.get('softkey_count')} Tasten in {s.get('softkey_columns')} Spalten "
+                                         f"zu {s.get('softkey_rows')}, je {s.get('softkey_width')} x "
+                                         f"{s.get('softkey_height')} Pixel")],
+                [Cell("Bilder"), Cell(f"vt-render aus AgIsoVirtualTerminal {m.get('vt_commit', '')[:10]}"
+                                      f"{' (geändert)' if m.get('vt_commit_dirty') else ''}, "
+                                      f"{s.get('juce_version', '')}. Text in DejaVu Sans Mono statt der Schrift "
+                                      "des Terminals, blinkende Objekte im sichtbaren Zustand.")]]
+        else:
+            props.append([Cell("Bilder"), Cell("keine (--vt-render nicht angegeben)")])
+        if vt.render_error:
+            props.append([Cell("Fehler"), Cell(vt.render_error)])
+        flow.table([("Eigenschaft", 3), ("Wert", 12)], props)
+        designator = vt.images.get("ws_designator.png")
+        if designator is not None:
+            flow.subheading("Working-Set-Symbol")
+            flow.image(designator, 30 * mm)
+
+        flow.subheading("Masken")
+        flow.table([("Blatt", 1.2), ("Art", 3), ("Maske", 5), ("Soft-Key-Maske", 5), ("Objekte", 1.5)],
+                   [[Cell(self.ref(f"vt:{mk.id}"), f"vt:{mk.id}"), Cell(VT_MASK_LABELS[mk.cls]),
+                     Cell(vt.label(mk.id), f"vt:{mk.id}"),
+                     Cell(vt.label(mk.soft_key_mask), f"vt:{mk.soft_key_mask}") if mk.soft_key_mask is not None
+                     else Cell(""),
+                     Cell(str(sum(o.cls != "CSoftKeyMask" for o in mk.objects)))] for mk in vt.masks])
+        if vt.aux:
+            flow.subheading("Auxiliary-Funktionen")
+            flow.table([("ID", 1.2), ("Name", 5), ("Verwendet in (4diac)", 9)],
+                       [[Cell(str(a)), Cell(vt.names.get(a, "")), self._vt_usage_cell(a)] for a in vt.aux])
+        unsupported = [u for u in m.get("unsupported_objects", []) if u.get("status") == "unsupported"]
+        if unsupported:
+            flow.subheading("Vom Renderer nicht gezeichnete Objekte")
+            flow.table([("Objekt", 5), ("Typ", 3), ("Grund", 8)],
+                       [[Cell(vt.label(u["object_id"])), Cell(u.get("object_type", "")), Cell(u.get("reason", ""))]
+                        for u in unsupported])
+        self._out.extend(flow.sheets)
+        for mask in vt.masks:
+            self._plan_vt_mask(mask)
+
+    def _plan_vt_mask(self, mask: VtMask):
+        vt = self.vt
+        key = f"vt:{mask.id}"
+        label = VT_MASK_LABELS[mask.cls]
+        subtitle = f"Objekt {mask.id}" + (f", Soft-Key-Maske {vt.label(mask.soft_key_mask)}"
+                                          if mask.soft_key_mask is not None else "")
+        img = mask.image
+        landscape = True
+        if img is not None:
+            land, port = self.geometry(True).area, self.geometry(False).area
+            landscape = min(land.w / img.width, land.h / img.height) >= min(port.w / img.width, port.h / img.height)
+        sheet = Sheet(key, f"{label} {mask.name or mask.id}", subtitle, level=1, landscape=landscape)
+        geo = self.geometry(landscape)
+        a = geo.area
+        fields: Dict[int, str] = {}
+        if img is None:
+            sheet.ops.append(lambda c, d: _text(c, a.x, a.top - 10, "(kein Bild: vt-render nicht angegeben "
+                                                "oder fehlgeschlagen)", FONT_ITALIC, 9, GREY))
+        else:
+            scale = min(a.w / img.width, a.h / img.height, 2.0)
+            w, h = img.width * scale, img.height * scale
+            x, y = a.x + (a.w - w) / 2, a.y + (a.h - h) / 2
+            sheet.ops.append(lambda c, d: _draw_image(c, img, x, y, w, h))
+            for i, obj in enumerate(mask.objects):
+                if obj.pos is not None:
+                    fields[i] = geo.field_of(x + obj.pos[0] * scale, y + h - obj.pos[1] * scale)
+        self._out.append(sheet)
+
+        flow = self._vt_flow(f"{key}#objects", f"{mask.name or mask.id} – Objekte", subtitle, 2)
+        flow.heading(f"{label} {vt.label(mask.id)}")
+        rows = []
+        for i, obj in enumerate(mask.objects):
+            where = Cell(f"{self.ref(key)}/{fields[i]}", key) if i in fields else Cell("")
+            link = f"vt:{obj.id}" if obj.cls in VT_MASK_LABELS else None
+            rows.append([Cell(str(obj.id)), Cell(obj.name, link, indent=obj.depth),
+                         Cell(obj.cls[1:] if obj.cls.startswith("C") else obj.cls), where,
+                         self._vt_usage_cell(obj.id)])
+        flow.table([("ID", 1.2), ("Name", 5), ("Klasse", 2.5), ("Blatt/Feld", 1.4), ("Verwendet in (4diac)", 7)], rows)
+        self._out.extend(flow.sheets)
 
     # ----- appendix -----
 
@@ -1502,7 +1892,7 @@ def default_output_dir(project_dir: Path) -> Path:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Erzeugt eine PDF-Dokumentation eines Eclipse 4diac Projekts, ausgehend von der Ressource.")
-    parser.add_argument("project", nargs="?", default=str(DEFAULT_PROJECT),
+    parser.add_argument("project",
                         help="4diac-Projektordner (mit .project) oder Workspace mit genau einem Projekt")
     parser.add_argument("-o", "--output", help="Ausgabe-PDF (Standard: <Projekt>_Dokumentation.pdf)")
     parser.add_argument("--lib", action="append", default=[], help="Zusätzliche Typbibliothek (mehrfach möglich)")
@@ -1510,8 +1900,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--title", help="Projekttitel auf Deckblatt und Schriftfeld")
     parser.add_argument("--svg-tool", default=str(SVG_TOOL_DIR),
                         help="Pfad zu IEC61499_FunctionBlock_SVG (oder Umgebungsvariable IEC61499_SVG_TOOL)")
+    vt = parser.add_argument_group("Bedienoberfläche (ISOBUS-VT)")
+    vt.add_argument("--vt-pool", help="ISO-Designer-Poolordner (mit .jop und Output/<Pool>.iop)")
+    vt.add_argument("--pool-scripts", help="Ordner mit list_mask_objects.py (scripts_central)")
+    vt.add_argument("--vt-render", help="vt-render.exe aus AgIsoVirtualTerminal (ohne: nur Tabellen, keine Bilder)")
+    vt.add_argument("--vt-softkeys", type=int,
+                    help="Soft-Keys des Terminals (Standard: größte Soft-Key-Maske des Pools)")
+    vt.add_argument("--vt-mask-size", type=int, help="Datenmaskengröße in Pixel (Standard: ISO_MASK_SIZE aus .iop.h)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
+    if args.vt_pool and not args.pool_scripts:
+        parser.error("--vt-pool braucht --pool-scripts")
 
     init_fonts()
     missing_libs = [p for p in args.lib if not Path(p).is_dir()]
@@ -1524,6 +1923,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  {len(project.types)} Projekttypen, {len(project.systems)} System(e), "
           f"{len(project.lib_dirs)} Bibliotheken")
     doc = Document(project, args.paper, args.title)
+    if args.vt_pool:
+        try:
+            doc.vt = VtPool(Path(args.vt_pool), Path(args.pool_scripts),
+                            Path(args.vt_render) if args.vt_render else None,
+                            args.vt_softkeys, args.vt_mask_size, doc.project_title, doc.org)
+            print(f"Objektpool: {doc.vt.jop} ({len(doc.vt.cls)} Objekte, {len(doc.vt.masks)} Masken, "
+                  f"{len(doc.vt.images)} Bilder)")
+        except (ImportError, OSError, ValueError, ET.ParseError) as exc:
+            print(f"[WARNUNG] Objektpool wird nicht dokumentiert: {exc}", file=sys.stderr)
     doc.plan()
     for type_name in sorted(doc.missing):
         print(f"[WARNUNG] Typ {type_name or '(leer)'}: {project.problems.get(type_name, 'nicht gefunden')}",
